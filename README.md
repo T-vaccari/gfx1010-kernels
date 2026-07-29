@@ -1,10 +1,126 @@
-# gfx1010-attention
+# gfx1010-kernels
 
-Fused scaled dot-product attention for AMD `gfx1010`, packaged independently
-from any model repository. It is tuned and tested on a Radeon RX 5600 XT with
-the ROCm build of PyTorch and Triton from the `ml` Conda environment.
+Reusable PyTorch training kernels for AMD `gfx1010`, developed and measured on
+a Radeon RX 5600 XT with a machine-specific PyTorch/ROCm/Triton stack. The
+library exposes standalone operators and does not depend on a model
+implementation.
 
-The sequence length is a runtime value, not a fixed kernel constant. The
+The canonical import is `gfx1010_kernels`. The historical
+`gfx1010_attention` import remains supported and exposes the same attention
+API, patching utilities and precompile command.
+
+The current library contains:
+
+- a native HIP fused residual-add, dropout and LayerNorm operation with
+  first-order autograd;
+- fused scaled dot-product attention implemented with Triton and ROCm
+  operations;
+- explicit compatibility checks, strict fast-path selection and transparent
+  PyTorch fallbacks.
+
+## Residual + LayerNorm
+
+The implementation, backward equations, tuned runtime dispatch and validation
+procedure are documented in
+[`docs/residual_layer_norm.md`](docs/residual_layer_norm.md).
+
+The public operation is equivalent to:
+
+```python
+dropped = torch.nn.functional.dropout(branch, dropout_p, training)
+updated = x + dropped
+normalized = torch.nn.functional.layer_norm(
+    updated,
+    (updated.shape[-1],),
+    weight,
+    bias,
+    eps,
+)
+```
+
+It returns both tensors:
+
+```python
+from gfx1010_kernels import residual_layer_norm
+
+updated, normalized = residual_layer_norm(
+    x,
+    branch,
+    weight,
+    bias,
+    dropout_p=0.15,
+    eps=1e-5,
+    training=True,
+    implementation="gfx1010",
+)
+```
+
+`updated` is the FP32 residual stream that continues through the skip
+connections. `normalized` is the LayerNorm result consumed by the following
+attention or MLP sublayer. Returning both avoids recomputing or materializing
+the residual addition outside the fused operation.
+
+### Native fast-path contract
+
+| Property | Supported native HIP path |
+|---|---|
+| GPU architecture | AMD `gfx1010` |
+| Execution | PyTorch eager mode on ROCm |
+| `x` | Contiguous FP32 tensor |
+| `branch` | Same shape as `x`, contiguous FP16 or FP32 |
+| `weight`, `bias` | Contiguous FP32 vectors |
+| Hidden size | 128, 256, 384, 512, 768, 1024 |
+| Leading dimensions | Any non-empty shape accepted by the memory budget |
+| Dropout | `0 <= dropout_p < 1`, fused during training |
+| Autograd | First-order forward and backward |
+
+Only the hidden dimension is compile-time specialized. Batch size, sequence
+length and all other leading dimensions are flattened into a runtime row
+count, so changing context length does not require compiling another kernel.
+The implementation includes tail-row handling; context length is not restricted
+to a particular alignment.
+
+The native forward fuses dropout, residual addition, mean/variance reduction
+and affine LayerNorm. It saves the updated residual, row mean, reciprocal
+standard deviation and a wave32 bit-packed dropout mask required by backward.
+Backward computes input gradients and the reductions for `weight` and `bias`.
+Its default fast path uses grouped FP32 atomics for the two parameter
+gradients. Those reductions match PyTorch within the documented numerical
+tolerances, but their final few bits are not guaranteed to be reproducible.
+`torch.use_deterministic_algorithms(True)` selects a separate fixed-order
+partial-reduction path for bitwise replay.
+
+### Selection and diagnostics
+
+```python
+from gfx1010_kernels import (
+    can_use_residual_layer_norm,
+    residual_layer_norm_status,
+)
+
+print(residual_layer_norm_status())
+print(can_use_residual_layer_norm(x, branch, weight, bias, dropout_p=0.15))
+```
+
+`residual_layer_norm_status()` checks the native HIP extension directly; it
+does not require the Triton attention backend to be available.
+
+`implementation` controls dispatch:
+
+- `gfx1010` requires the native fast path and raises `RuntimeError` with the
+  rejected condition when it cannot be used;
+- `auto` selects the native path when compatible, otherwise emits
+  `RuntimeWarning` and calls the PyTorch reference;
+- `torch` always calls the PyTorch decomposition;
+- `triton` explicitly selects the experimental Triton normalization path and
+  raises if that backend is unavailable.
+
+Use `implementation="gfx1010"` in validation and performance runs when a
+fallback must be treated as an error.
+
+## Attention
+
+Attention sequence length is a runtime value, not a fixed kernel constant. The
 dispatcher selects a tuned tile configuration while the same compiled kernel
 handles aligned and tail sequence lengths. `head_dim` remains compile-time
 specialized because that lets Triton generate substantially better code.
@@ -17,7 +133,7 @@ faster on the measured high-parallelism profiles but uses O(batch·heads·N²)
 temporary memory; `auto` falls back to PyTorch outside the measured faster
 training regions.
 
-## Fast-path support
+### Attention fast-path support
 
 | Property | Supported fast path |
 |---|---|
@@ -61,22 +177,44 @@ For the D64/D128 hybrid backward, reduction blocks are the next power of two
 of N. Measured launch choices use one warp for blocks up to 64 and for blocks
 256/1024, four warps for blocks 128/512, and eight for 2048/4096.
 
-## Install in Conda `ml`
+## Installation
 
 Do not install another PyTorch or Triton wheel: the environment already
-contains the machine-specific ROCm builds.
+needs to contain compatible ROCm builds of both packages. Build isolation must
+remain disabled because `setup.py` imports the existing PyTorch installation to
+compile the HIP extension.
 
 ```bash
-source /home/tom/miniforge3/etc/profile.d/conda.sh
-conda activate ml
-cd /home/tom/machine-learning/gfx1010-attention
-python -m pip install -e . --no-deps --no-build-isolation
+cd gfx1010-kernels
+CXX=/usr/bin/c++ PYTORCH_ROCM_ARCH=gfx1010 \
+  python -m pip install -e . --no-deps --no-build-isolation
+```
 
+Verify both independent backends in a fresh process:
+
+```bash
+python -c "import gfx1010_kernels as g; print(g.__version__); print(g.residual_layer_norm_status()); print(g.backend_status())"
+```
+
+The distribution was called `gfx1010-attention` before version 0.3. Remove its
+stale editable metadata once when migrating, then repeat the installation
+above:
+
+```bash
+python -m pip uninstall gfx1010-attention
+```
+
+### Optional global attention patch
+
+Residual LayerNorm uses the explicit `gfx1010_kernels` API. Attention can
+additionally be installed as a process-wide PyTorch patch:
+
+```bash
 SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"
 cp deploy/gfx1010_attention_autoload.pth "$SITE_PACKAGES/"
 ```
 
-The `.pth` file installs a process-wide patch when Python starts, so
+The `.pth` file runs when Python starts, so
 `torch.nn.functional.scaled_dot_product_attention` and
 `torch.nn.MultiheadAttention` can use the optimized dispatcher without
 project-specific imports. While the patch is active, PyTorch's separate native
@@ -88,7 +226,7 @@ the dispatcher; its previous setting is restored on uninstall.
 through a different PyTorch path and therefore bypasses the kernel. The global
 patch warns for that call in `auto` mode and raises in strict mode.
 
-Verify the installation in a fresh Python process:
+Verify the optional patch in another fresh process:
 
 ```bash
 python -c "import gfx1010_attention as g; print(g.backend_status()); print(g.is_pytorch_patch_installed())"
@@ -101,13 +239,13 @@ startup file:
 
 ```bash
 rm "$SITE_PACKAGES/gfx1010_attention_autoload.pth"
-python -m pip uninstall gfx1010-attention
+python -m pip uninstall gfx1010-kernels
 ```
 
-## Direct API
+## Attention direct API
 
 ```python
-from gfx1010_attention import scaled_dot_product_attention
+from gfx1010_kernels import scaled_dot_product_attention
 
 output = scaled_dot_product_attention(
     query,
@@ -116,6 +254,12 @@ output = scaled_dot_product_attention(
     is_causal=True,
     implementation="gfx1010",
 )
+```
+
+Existing code can keep the compatibility import unchanged:
+
+```python
+from gfx1010_attention import scaled_dot_product_attention
 ```
 
 `implementation` controls fallback behavior:
@@ -167,13 +311,13 @@ and tail lengths, inference dispatches at batch 1/8/64, and training. The
 default long profiles are N=1024 and N=4096:
 
 ```bash
-gfx1010-attention-precompile
+gfx1010-kernels-precompile
 ```
 
 The profiles can be selected explicitly:
 
 ```bash
-gfx1010-attention-precompile \
+gfx1010-kernels-precompile \
   --head-dim 32 64 128 \
   --batch 1 8 64 \
   --heads 8 \
@@ -190,14 +334,69 @@ runtime-length kernel.
 
 ## Validate and benchmark
 
+The published measurements use this exact environment:
+
+| Component | Version |
+|---|---|
+| GPU | AMD Radeon RX 5600 XT, `gfx1010`, 6 GiB |
+| Python | 3.10.20 |
+| PyTorch | 2.8.0a0+gitba56102 |
+| ROCm reported by PyTorch | 7.2.53211-671d39a71e |
+| Triton | 3.5.1 |
+| Execution mode | Eager |
+
 ```bash
 python -m pytest -q
+
+python benchmarks/benchmark_residual_layer_norm_matrix.py \
+  --batch 1 \
+  --sequence 1024 \
+  --dropout 0.15 \
+  --dtype float16 \
+  --warmup 100 \
+  --reps 1000
+
+python benchmarks/benchmark_forward_vectorization.py
+python benchmarks/benchmark_backward_vectorization.py --dropout 0.15
+python benchmarks/benchmark_parameter_reduction.py --best-only
+
 python benchmarks/benchmark_gfx1010_attention.py \
   --batch 64 \
   --heads 8 \
   --sequence 55 64 96 128 192 \
   --head-dim 32
 ```
+
+The residual LayerNorm matrix covers hidden sizes 128, 256, 384, 512, 768 and
+1024. It measures the public API for both forward and complete
+forward-plus-backward execution against the equivalent PyTorch operations. It
+emits deterministically ordered JSON Lines with median, p20 and p80 CUDA-event
+times. Run the same matrix with `--dtype float32` to cover the FP32 branch
+specializations.
+
+The focused residual scripts measure the aligned vectorized forward path, the
+vectorized input backward and the tuned parameter-gradient reduction
+respectively. Their dispatch rules and intended use are described in the
+[residual LayerNorm implementation guide](docs/residual_layer_norm.md).
+
+The following residual LayerNorm results were measured on the RX 5600 XT with
+batch 1, hidden width 384, an FP32 residual stream, an FP16 branch and dropout
+0.15. Each median uses 100 warmup iterations and 1000 measured iterations.
+`Training` is the complete public forward-plus-backward call; speedup is
+PyTorch time divided by `gfx1010` time.
+
+| T | Forward speedup | Training speedup |
+|---:|---:|---:|
+| 128 | 1.273× | 1.269× |
+| 256 | 1.262× | 1.265× |
+| 512 | 1.303× | 1.292× |
+| 1024 | 1.242× | 1.299× |
+| 2048 | 1.792× | 1.846× |
+| 4096 | 1.839× | 2.021× |
+
+These measurements compare against the decomposition in this exact
+machine-specific PyTorch/ROCm build. They are representative of the stated
+shape and dtype, not a guarantee for a complete model or another system.
 
 Representative causal FP16 results measured on the RX 5600 XT on 2026-07-23
 are below. Times cover attention only, not a complete Transformer.
@@ -231,10 +430,11 @@ performance guard is material: forced D64 and D128 training at B=1, H=8,
 N=1024 measured 0.46× and 0.27× PyTorch respectively, so `auto` routes both to
 PyTorch.
 
-The benchmark emits JSON Lines and measures forward and backward separately.
-Compare only runs from the same GPU state and software build. The test suite
-checks the fused result against PyTorch and, for stricter numerical checks,
-against an FP32 reference.
+The attention benchmark also emits JSON Lines and measures forward and
+backward separately. Compare only runs from the same GPU state and software
+build. The test suite checks every native residual hidden specialization,
+forward and backward gradients, dropout behavior, edge cases, public dispatch
+and attention against PyTorch references.
 
 `benchmark_backward_formula.py` is an experimental diagnostic for comparing
 backward decompositions; it is not the production path.
@@ -243,5 +443,20 @@ backward decompositions; it is not the production path.
 
 Fallback is decided before launching a GPU kernel, so an unsupported operation
 cannot silently enter a generic branch inside the optimized kernel. In `auto`
-mode the warning includes the exact reason. In `gfx1010` or global strict mode
-the same condition is an error.
+mode the warning includes the exact reason. In `gfx1010` mode the same
+condition is an error.
+
+The two status calls intentionally answer different questions:
+
+- `residual_layer_norm_status()` reports whether the compiled native HIP
+  extension can execute on the current GPU;
+- `backend_status()` reports whether the Triton HIP attention backend targets
+  `gfx1010`.
+
+`GFX1010_ATTENTION_STRICT=1` applies only to the global attention patch.
+Residual LayerNorm is made strict per call with
+`implementation="gfx1010"`.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

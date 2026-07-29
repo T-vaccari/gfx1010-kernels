@@ -14,7 +14,7 @@ from gfx1010_attention import (
 
 
 def test_package_version():
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.3.0"
 
 
 def fp32_reference(query, key, value, is_causal, scale=None):

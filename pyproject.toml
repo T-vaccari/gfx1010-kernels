@@ -1,22 +1,36 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gfx1010-attention"
-version = "0.1.0"
-description = "Reusable fused attention kernels tuned for AMD gfx1010"
+name = "gfx1010-kernels"
+version = "0.3.0"
+description = "Reusable PyTorch ROCm transformer kernels tuned for AMD gfx1010"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+keywords = ["amd", "gfx1010", "gpu", "pytorch", "rocm", "transformer"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
 [project.scripts]
+gfx1010-kernels-precompile = "gfx1010_attention.precompile:main"
 gfx1010-attention-precompile = "gfx1010_attention.precompile:main"
 
 [tool.setuptools.packages.find]
-include = ["gfx1010_attention*"]
+include = ["gfx1010_attention*", "gfx1010_kernels*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
