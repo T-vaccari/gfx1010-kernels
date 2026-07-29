@@ -3,7 +3,7 @@ import json
 
 import torch
 
-from gfx1010_attention import (
+from gfx1010_kernels import (
     backend_status,
     scaled_dot_product_attention,
 )

@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from gfx1010_attention import (
+from gfx1010_kernels import (
     __version__,
     backend_status,
     can_use_gfx1010_kernel,
@@ -14,7 +14,7 @@ from gfx1010_attention import (
 
 
 def test_package_version():
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.4.0"
 
 
 def fp32_reference(query, key, value, is_causal, scale=None):
@@ -90,7 +90,7 @@ def test_pytorch_patch_installs_and_uninstalls(monkeypatch):
                 is_causal=True,
             )
         torch.testing.assert_close(actual, expected)
-        monkeypatch.setenv("GFX1010_ATTENTION_STRICT", "1")
+        monkeypatch.setenv("GFX1010_KERNELS_ATTENTION_STRICT", "1")
         with pytest.raises(
             RuntimeError,
             match="gfx1010 attention is unavailable",
@@ -192,11 +192,11 @@ def test_multihead_attention_default_is_diagnosed(monkeypatch):
         ) as warning:
             output, weights = module(inputs, inputs, inputs)
         assert warning[0].filename.endswith(
-            "test_gfx1010_attention.py"
+            "test_attention.py"
         )
         assert output.shape == inputs.shape
         assert weights is not None
-        monkeypatch.setenv("GFX1010_ATTENTION_STRICT", "1")
+        monkeypatch.setenv("GFX1010_KERNELS_ATTENTION_STRICT", "1")
         with pytest.raises(
             RuntimeError,
             match="requires need_weights=False",
@@ -229,7 +229,7 @@ def test_multihead_attention_fallback_warning_points_to_caller():
                 need_weights=False,
             )
         assert warning[0].filename.endswith(
-            "test_gfx1010_attention.py"
+            "test_attention.py"
         )
         assert output.shape == inputs.shape
         assert weights is None
@@ -1177,7 +1177,7 @@ def test_nn_multihead_attention_uses_global_patch(monkeypatch):
         need_weights=False,
     )
     install_pytorch_patch()
-    monkeypatch.setenv("GFX1010_ATTENTION_STRICT", "1")
+    monkeypatch.setenv("GFX1010_KERNELS_ATTENTION_STRICT", "1")
     try:
         actual, _ = fast_module(
             fast_input,
@@ -1225,7 +1225,7 @@ def test_nn_multihead_attention_eval_avoids_native_fastpath(monkeypatch):
     if initially_installed:
         uninstall_pytorch_patch()
     install_pytorch_patch()
-    monkeypatch.setenv("GFX1010_ATTENTION_STRICT", "1")
+    monkeypatch.setenv("GFX1010_KERNELS_ATTENTION_STRICT", "1")
 
     def reject_native_fastpath(*args, **kwargs):
         raise AssertionError("native MHA fast path bypassed gfx1010 attention")

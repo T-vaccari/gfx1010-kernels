@@ -5,9 +5,8 @@ a Radeon RX 5600 XT with a machine-specific PyTorch/ROCm/Triton stack. The
 library exposes standalone operators and does not depend on a model
 implementation.
 
-The canonical import is `gfx1010_kernels`. The historical
-`gfx1010_attention` import remains supported and exposes the same attention
-API, patching utilities and precompile command.
+All public operators and integration utilities are exposed through the
+`gfx1010_kernels` package.
 
 The current library contains:
 
@@ -196,14 +195,6 @@ Verify both independent backends in a fresh process:
 python -c "import gfx1010_kernels as g; print(g.__version__); print(g.residual_layer_norm_status()); print(g.backend_status())"
 ```
 
-The distribution was called `gfx1010-attention` before version 0.3. Remove its
-stale editable metadata once when migrating, then repeat the installation
-above:
-
-```bash
-python -m pip uninstall gfx1010-attention
-```
-
 ### Optional global attention patch
 
 Residual LayerNorm uses the explicit `gfx1010_kernels` API. Attention can
@@ -211,7 +202,7 @@ additionally be installed as a process-wide PyTorch patch:
 
 ```bash
 SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"
-cp deploy/gfx1010_attention_autoload.pth "$SITE_PACKAGES/"
+cp deploy/gfx1010_kernels_autoload.pth "$SITE_PACKAGES/"
 ```
 
 The `.pth` file runs when Python starts, so
@@ -229,16 +220,16 @@ patch warns for that call in `auto` mode and raises in strict mode.
 Verify the optional patch in another fresh process:
 
 ```bash
-python -c "import gfx1010_attention as g; print(g.backend_status()); print(g.is_pytorch_patch_installed())"
+python -c "import gfx1010_kernels as g; print(g.backend_status()); print(g.is_pytorch_patch_installed())"
 ```
 
 Disable the startup import for one process with
-`GFX1010_ATTENTION_AUTOLOAD=0`; `false`, `no` and `off` are equivalent. A full
+`GFX1010_KERNELS_AUTOLOAD=0`; `false`, `no` and `off` are equivalent. A full
 uninstall must remove both the editable package and the manually installed
 startup file:
 
 ```bash
-rm "$SITE_PACKAGES/gfx1010_attention_autoload.pth"
+rm "$SITE_PACKAGES/gfx1010_kernels_autoload.pth"
 python -m pip uninstall gfx1010-kernels
 ```
 
@@ -254,12 +245,6 @@ output = scaled_dot_product_attention(
     is_causal=True,
     implementation="gfx1010",
 )
-```
-
-Existing code can keep the compatibility import unchanged:
-
-```python
-from gfx1010_attention import scaled_dot_product_attention
 ```
 
 `implementation` controls fallback behavior:
@@ -280,13 +265,13 @@ The global patch defaults to `auto`. Make every unsupported call a hard error
 when validating a workload:
 
 ```bash
-GFX1010_ATTENTION_STRICT=1 python your_program.py
+GFX1010_KERNELS_ATTENTION_STRICT=1 python your_program.py
 ```
 
 The patch can also be controlled explicitly:
 
 ```python
-from gfx1010_attention import install_pytorch_patch, uninstall_pytorch_patch
+from gfx1010_kernels import install_pytorch_patch, uninstall_pytorch_patch
 
 install_pytorch_patch()
 uninstall_pytorch_patch()
@@ -360,7 +345,7 @@ python benchmarks/benchmark_forward_vectorization.py
 python benchmarks/benchmark_backward_vectorization.py --dropout 0.15
 python benchmarks/benchmark_parameter_reduction.py --best-only
 
-python benchmarks/benchmark_gfx1010_attention.py \
+python benchmarks/benchmark_attention.py \
   --batch 64 \
   --heads 8 \
   --sequence 55 64 96 128 192 \
@@ -453,7 +438,7 @@ The two status calls intentionally answer different questions:
 - `backend_status()` reports whether the Triton HIP attention backend targets
   `gfx1010`.
 
-`GFX1010_ATTENTION_STRICT=1` applies only to the global attention patch.
+`GFX1010_KERNELS_ATTENTION_STRICT=1` applies only to the global attention patch.
 Residual LayerNorm is made strict per call with
 `implementation="gfx1010"`.
 

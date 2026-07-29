@@ -4,7 +4,7 @@ import warnings
 import torch
 from torch.nn import functional as F
 
-from gfx1010_attention import BackendStatus, backend_status
+from .attention import BackendStatus, backend_status
 
 
 MIN_HIDDEN_SIZE = 128

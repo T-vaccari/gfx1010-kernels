@@ -3,7 +3,7 @@ import json
 
 import torch
 
-from gfx1010_attention.functional import (
+from gfx1010_kernels.attention import (
     TORCH_SCALED_DOT_PRODUCT_ATTENTION,
 )
 

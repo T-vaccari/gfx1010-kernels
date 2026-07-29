@@ -6,7 +6,6 @@ recursive-include benchmarks *.py
 recursive-include csrc *.cpp *.h *.hip
 recursive-include deploy *.pth
 recursive-include docs *.md
-recursive-include gfx1010_attention *.py
 recursive-include gfx1010_kernels *.py
 recursive-include tests *.py
 global-exclude *.py[cod]

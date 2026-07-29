@@ -3,7 +3,7 @@ import json
 
 import torch
 
-from .functional import (
+from .attention import (
     SUPPORTED_HEAD_DIMS,
     backend_status,
     scaled_dot_product_attention,

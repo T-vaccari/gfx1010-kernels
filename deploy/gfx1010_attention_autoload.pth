@@ -1,1 +1,0 @@
-import os; os.environ.get("GFX1010_ATTENTION_AUTOLOAD", "1").lower() not in {"0", "false", "no", "off"} and __import__("gfx1010_attention.autoload")

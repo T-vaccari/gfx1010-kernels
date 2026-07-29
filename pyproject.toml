@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gfx1010-kernels"
-version = "0.3.0"
+version = "0.4.0"
 description = "Reusable PyTorch ROCm transformer kernels tuned for AMD gfx1010"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,11 +26,10 @@ classifiers = [
 test = ["pytest>=8"]
 
 [project.scripts]
-gfx1010-kernels-precompile = "gfx1010_attention.precompile:main"
-gfx1010-attention-precompile = "gfx1010_attention.precompile:main"
+gfx1010-kernels-precompile = "gfx1010_kernels.precompile:main"
 
 [tool.setuptools.packages.find]
-include = ["gfx1010_attention*", "gfx1010_kernels*"]
+include = ["gfx1010_kernels*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

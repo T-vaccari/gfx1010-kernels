@@ -5,7 +5,7 @@ import warnings
 import torch
 from torch.nn import functional as F
 
-from .functional import (
+from .attention import (
     TORCH_SCALED_DOT_PRODUCT_ATTENTION,
     scaled_dot_product_attention,
 )
@@ -14,9 +14,9 @@ from .functional import (
 _previous_attention = None
 _previous_mha_forward = None
 _previous_mha_fastpath = None
-_inside_mha = ContextVar("gfx1010_attention_inside_mha", default=False)
+_inside_mha = ContextVar("gfx1010_kernels_inside_mha", default=False)
 _torch_mha_forward = torch.nn.MultiheadAttention.forward
-STRICT_ENVIRONMENT_VARIABLE = "GFX1010_ATTENTION_STRICT"
+STRICT_ENVIRONMENT_VARIABLE = "GFX1010_KERNELS_ATTENTION_STRICT"
 
 
 def _strict_enabled():
