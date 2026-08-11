@@ -947,6 +947,42 @@ def test_high_parallelism_long_context_backward(is_causal):
     not backend_status().available,
     reason="requires the gfx1010 ROCm server",
 )
+def test_gpt2_d64_batch_six_backward():
+    torch.manual_seed(1010)
+    shape = (6, 12, 1024, 64)
+    source = [
+        torch.randn(shape, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    fast = [tensor.detach().clone().requires_grad_() for tensor in source]
+    reference = [tensor.detach().clone().requires_grad_() for tensor in source]
+    grad = torch.randn(shape, device="cuda", dtype=torch.float16)
+    actual = scaled_dot_product_attention(
+        *fast,
+        is_causal=True,
+        implementation="gfx1010",
+    )
+    expected = scaled_dot_product_attention(
+        *reference,
+        is_causal=True,
+        implementation="torch",
+    )
+    actual.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    for actual_tensor, expected_tensor in zip(fast, reference):
+        torch.testing.assert_close(
+            actual_tensor.grad,
+            expected_tensor.grad,
+            atol=4e-2,
+            rtol=4e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not backend_status().available,
+    reason="requires the gfx1010 ROCm server",
+)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_matmul_backward_long_context(head_dim, is_causal):
