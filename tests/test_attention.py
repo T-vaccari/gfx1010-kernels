@@ -947,9 +947,10 @@ def test_high_parallelism_long_context_backward(is_causal):
     not backend_status().available,
     reason="requires the gfx1010 ROCm server",
 )
-def test_gpt2_d64_batch_six_backward():
+@pytest.mark.parametrize("batch", [1, 6])
+def test_gpt2_d64_backward(batch):
     torch.manual_seed(1010)
-    shape = (6, 12, 1024, 64)
+    shape = (batch, 12, 1024, 64)
     source = [
         torch.randn(shape, device="cuda", dtype=torch.float16)
         for _ in range(3)
