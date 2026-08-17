@@ -126,11 +126,17 @@ specialized because that lets Triton generate substantially better code.
 
 The D=32 path streams attention and its first-order backward without creating
 an N×N attention matrix. D=64/128 use the same fused streaming forward plus a
-hybrid backward: two Triton row-reduction kernels handle masked softmax and its
-derivative, while ROCm matmuls compute the matrix products. The hybrid route is
-faster on the measured high-parallelism profiles but uses O(batch·heads·N²)
-temporary memory; `auto` falls back to PyTorch outside the measured faster
-training regions.
+hybrid backward built from Triton row kernels and ROCm matrix products. The
+general hybrid route materializes the N×N attention matrix and is therefore
+restricted by the `auto` performance guard.
+
+Causal FP16 GPT-2 training at `B<=2`, `H=12`, `N=1024`, `D=64` has a separate
+chunked backward. It reuses the forward log-sum-exp values and reconstructs
+256 query rows at a time, so its working memory is
+O(batch·heads·256·N + batch·heads·N·D), rather than O(batch·heads·N²).
+The matrix contractions use ROCm BLAS and the causal softmax reconstruction and
+derivative use Triton. Unsupported batch sizes, non-causal calls, BF16, and
+partial Q/K/V gradient requests remain on the PyTorch fallback in `auto` mode.
 
 ### Attention fast-path support
 
@@ -169,6 +175,7 @@ and AMD waves per execution unit.
 | D32 training | BH≥64 and N≥1024, or N≥4096 | BMK8/BNK32 and BMQ32/BNQ8, w2/s1/v1 |
 | D64 inference | default | BM16/BN8, w1/s1/v1 |
 | D64 causal inference | BH≥8 and N≥1024 | BM32/BN4, w2; s2 below 4096, otherwise s1 |
+| D64 GPT-2 training | B≤2, H=12, N=1024, causal FP16, all Q/K/V gradients | fused streaming forward; 256-row chunked backward |
 | D128 inference | default | BM8/BN4, w1/s1/v1 |
 | D128 causal inference | BH≥8 and N≥1024 | BM16/BN4, w2/s1/v1 |
 
@@ -247,6 +254,27 @@ output = scaled_dot_product_attention(
 )
 ```
 
+For the compiled GPT-2 profile, keep the model and projection layers in FP32
+and cast only Q/K/V into the attention operator. Convert its output back to the
+residual-stream dtype:
+
+```python
+query = query.to(torch.float16)
+key = key.to(torch.float16)
+value = value.to(torch.float16)
+output = scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    is_causal=True,
+    implementation="auto",
+)
+output = output.to(residual.dtype)
+```
+
+Explicit FP16 Q/K/V remain eligible inside an outer FP32 autocast context.
+BF16 autocast deliberately falls back.
+
 `implementation` controls fallback behavior:
 
 - `gfx1010`: require the optimized path and raise `RuntimeError` otherwise.
@@ -255,11 +283,15 @@ output = scaled_dot_product_attention(
 - `torch`: force the original PyTorch SDPA implementation silently.
 
 For compatible D=32 calls, `auto` always selects the custom path. During
-training, D=64/128 select the hybrid backward at N≤192 when 8≤BH≤512; D=64
-also selects it for 192<N≤1024 when BH≥64 and
-BH·N²≤64·1024². Other D=64/128 training profiles fall back because PyTorch was
-faster in measurement. `gfx1010` bypasses this performance guard and forces the
-custom implementation, while retaining all compatibility checks.
+training, the specialized causal FP16 GPT-2 profile selects the chunked
+backward at B≤2, H=12, N=1024 and D=64 when all Q/K/V gradients are required.
+The remaining D=64/128 profiles select the general hybrid backward at N≤192
+when 8≤BH≤512; D=64 also selects it for 192<N≤1024 when BH≥64 and
+BH·N²≤64·1024². Other D=64/128 training profiles fall back because PyTorch
+was faster in measurement. `gfx1010` bypasses the performance guard and forces
+the custom implementation, while retaining the basic compatibility checks;
+production validation should use `auto` to preserve the specialized safety
+gate.
 
 The global patch defaults to `auto`. Make every unsupported call a hard error
 when validating a workload:
@@ -283,11 +315,13 @@ also bypass this Python-level integration.
 
 ## PyTorch execution compatibility
 
-The supported production mode in the current `ml` environment is eager
-execution. Its PyTorch/Triton combination fails `torch.compile`, export and
-AOTAutograd with `ImportError: cannot import name 'triton_key'`; the custom
-autograd wrapper is also not registered as a `torch.library.triton_op`.
-`torch.func`, `vmap`, `jvp` and higher-order gradients are unsupported.
+The validated candidate PyTorch build supports `torch.compile` with this
+operator. A B=2 GPT-2-shaped output-and-gradient smoke test matches eager
+execution. Dynamo currently inserts four graph breaks around Triton's HIP
+driver checks, so this is compatibility with graph breaks, not a
+`fullgraph=True` guarantee; fullgraph compilation is unsupported. Export,
+AOTAutograd, `torch.func`, `vmap`, `jvp` and higher-order gradients are also
+unsupported.
 
 ## Precompile
 
@@ -327,8 +361,8 @@ The published measurements use this exact environment:
 | Python | 3.10.20 |
 | PyTorch | 2.8.0a0+gitba56102 |
 | ROCm reported by PyTorch | 7.2.53211-671d39a71e |
-| Triton | 3.5.1 |
-| Execution mode | Eager |
+| Triton | 3.4.0 |
+| Execution mode | Eager and `torch.compile` with graph breaks |
 
 ```bash
 python -m pytest -q
@@ -383,11 +417,13 @@ These measurements compare against the decomposition in this exact
 machine-specific PyTorch/ROCm build. They are representative of the stated
 shape and dtype, not a guarantee for a complete model or another system.
 
-Representative causal FP16 results measured on the RX 5600 XT on 2026-07-23
+Representative causal FP16 results measured on the RX 5600 XT on 2026-08-17
 are below. Times cover attention only, not a complete Transformer.
 
 | Mode | B | H | N | D | gfx1010 ms | PyTorch ms | Speedup |
 |---|---:|---:|---:|---:|---:|---:|---:|
+| training total | 1 | 12 | 1024 | 64 | 7.253 | 8.438 | 1.16× |
+| training total | 2 | 12 | 1024 | 64 | 13.236 | 14.404 | 1.09× |
 | inference | 64 | 8 | 64 | 32 | 0.164 | 0.877 | 5.33× |
 | training total | 64 | 8 | 64 | 32 | 0.617 | 1.858 | 3.01× |
 | inference | 64 | 8 | 192 | 32 | 0.987 | 4.610 | 4.67× |
@@ -408,12 +444,25 @@ are below. Times cover attention only, not a complete Transformer.
 | inference | 1 | 8 | 2048 | 128 | 8.723 | 9.866 | 1.13× |
 | inference | 1 | 8 | 4096 | 128 | 32.685 | 36.766 | 1.12× |
 
+For the specialized B=2 GPT-2 row, the custom forward/backward medians were
+2.978/10.371 ms versus 6.781/7.662 ms for forced PyTorch math SDPA. Peak
+incremental allocated/reserved memory for the complete custom call was
+109.15/115.34 MiB versus 424.67/429.92 MiB for PyTorch math SDPA. Three seeds
+at both B=1 and B=2 passed output, dQ, dK and dV comparison with no non-finite
+values; worst absolute error was 0.001953125.
+
+The end-to-end acceptance workload was a compiled FP32 GPT-2 model with only
+Q/K/V attention inputs cast to FP16, B=2, H=12, N=1024, D=64, and eight
+gradient-accumulation microsteps. Excluding the compilation step, 14 sustained
+steps measured a mean 3689.13 tokens/s (range 3685.97–3693.09), exceeding the
+3500 tokens/s FP32 baseline by 5.4%. Casting all linear layers to FP16 is a
+different execution path and was slower on this GPU.
+
 The PyTorch comparison is the implementation available in this exact
 machine-specific build; it reports that memory-efficient SDPA was not compiled
 in. Results therefore must not be extrapolated to another ROCm build. The
-performance guard is material: forced D64 and D128 training at B=1, H=8,
-N=1024 measured 0.46× and 0.27× PyTorch respectively, so `auto` routes both to
-PyTorch.
+performance guard remains material: unsupported D64/D128 profiles can be
+slower than PyTorch, so `auto` routes them to the fallback.
 
 The attention benchmark also emits JSON Lines and measures forward and
 backward separately. Compare only runs from the same GPU state and software

@@ -17,6 +17,7 @@ from .normalization import (
     residual_layer_norm,
     residual_layer_norm_status,
 )
+from .linear import AutocastLinear, autocast_linear
 
 __version__ = "0.4.0"
 
@@ -25,7 +26,9 @@ __all__ = [
     "BackendStatus",
     "MAX_SEQUENCE_LENGTH",
     "SUPPORTED_HEAD_DIMS",
+    "AutocastLinear",
     "backend_status",
+    "autocast_linear",
     "can_use_gfx1010_kernel",
     "can_use_residual_layer_norm",
     "install_pytorch_patch",
