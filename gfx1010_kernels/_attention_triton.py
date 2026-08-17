@@ -45,8 +45,9 @@ def _attention_probabilities(
     do_not_specialize=["sequence_length", "query_start"],
     do_not_specialize_on_alignment=["sequence_length", "query_start"],
 )
-def _attention_probabilities_from_logsumexp(
+def _attention_probabilities_and_backward_score(
     scores,
+    grad_score,
     logsumexp,
     scale_log2,
     sequence_length,
@@ -76,10 +77,25 @@ def _attention_probabilities_from_logsumexp(
         mask=row_valid,
         other=0.0,
     )
-    probabilities = tl.math.exp2(logits * scale_log2 - maximum)
+    probabilities = tl.where(
+        valid,
+        tl.math.exp2(logits * scale_log2 - maximum),
+        0.0,
+    )
+    grad_probability = tl.load(
+        grad_score + row * sequence_length + column_offsets,
+        mask=row_valid & column_valid,
+        other=0.0,
+    ).to(tl.float32)
+    delta = tl.sum(probabilities * grad_probability, axis=0)
     tl.store(
         scores + row * sequence_length + column_offsets,
-        tl.where(valid, probabilities, 0.0),
+        probabilities,
+        mask=row_valid & column_valid,
+    )
+    tl.store(
+        grad_score + row * sequence_length + column_offsets,
+        probabilities * (grad_probability - delta),
         mask=row_valid & column_valid,
     )
 
@@ -947,7 +963,7 @@ class TritonAttention(torch.autograd.Function):
         use_chunked_backward = (
             needs_backward
             and all(ctx.needs_input_grad[:3])
-            and batch <= 2
+            and batch <= 4
             and head_dim == 64
             and sequence_length == 1024
             and causal
@@ -1217,7 +1233,7 @@ class TritonAttention(torch.autograd.Function):
         query, key, value, logsumexp = ctx.saved_tensors
         batch, heads, sequence_length, head_dim = query.shape
         batch_heads = batch * heads
-        block_rows = 256
+        block_rows = 512
         scale = ctx.scale
         scale_log2 = scale * 1.4426950408889634
 
@@ -1270,28 +1286,19 @@ class TritonAttention(torch.autograd.Function):
                 query_start:query_start + block_rows,
             ]
             torch.bmm(query_block, key_transposed, out=probabilities)
-            _attention_probabilities_from_logsumexp[(probability_rows,)](
-                probabilities,
-                logsumexp,
-                scale_log2,
-                sequence_length,
-                query_start,
-                block_rows=block_rows,
-                block_n=probability_block,
-                num_warps=1,
-                num_stages=1,
-                waves_per_eu=1,
-                allow_flush_denorm=True,
-            )
             torch.bmm(
                 grad_output_block,
                 value_transposed,
                 out=grad_score,
             )
-            _attention_backward_score[(probability_rows,)](
+            _attention_probabilities_and_backward_score[(probability_rows,)](
                 probabilities,
                 grad_score,
+                logsumexp,
+                scale_log2,
                 sequence_length,
+                query_start,
+                block_rows=block_rows,
                 block_n=probability_block,
                 num_warps=1,
                 num_stages=1,

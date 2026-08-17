@@ -985,7 +985,7 @@ def test_gpt2_d64_backward(batch):
     not backend_status().available,
     reason="requires the gfx1010 ROCm server",
 )
-@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("batch", [1, 2, 4])
 def test_gpt2_d64_auto_backward(monkeypatch, batch):
     torch.manual_seed(2008 + batch)
     shape = (batch, 12, 1024, 64)
@@ -1078,7 +1078,7 @@ def test_gpt2_d64_auto_accepts_explicit_fp16_under_fp32_autocast(
     [
         (1, False, (True, True, True)),
         (1, True, (True, False, False)),
-        (3, True, (True, True, True)),
+        (5, True, (True, True, True)),
     ],
 )
 def test_gpt2_d64_auto_unsupported_falls_back(
