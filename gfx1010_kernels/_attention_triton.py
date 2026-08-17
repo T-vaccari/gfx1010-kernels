@@ -42,6 +42,49 @@ def _attention_probabilities(
 
 
 @triton.jit(
+    do_not_specialize=["sequence_length", "query_start"],
+    do_not_specialize_on_alignment=["sequence_length", "query_start"],
+)
+def _attention_probabilities_from_logsumexp(
+    scores,
+    logsumexp,
+    scale_log2,
+    sequence_length,
+    query_start,
+    block_rows: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    row = tl.program_id(0)
+    batch_head = row // block_rows
+    row_in_block = row % block_rows
+    query_position = query_start + row_in_block
+    column_offsets = tl.arange(0, block_n)
+    row_valid = query_position < sequence_length
+    column_valid = column_offsets < sequence_length
+    valid = (
+        row_valid
+        & column_valid
+        & (column_offsets <= query_position)
+    )
+    logits = tl.load(
+        scores + row * sequence_length + column_offsets,
+        mask=row_valid & column_valid,
+        other=0.0,
+    ).to(tl.float32)
+    maximum = tl.load(
+        logsumexp + batch_head * sequence_length + query_position,
+        mask=row_valid,
+        other=0.0,
+    )
+    probabilities = tl.math.exp2(logits * scale_log2 - maximum)
+    tl.store(
+        scores + row * sequence_length + column_offsets,
+        tl.where(valid, probabilities, 0.0),
+        mask=row_valid & column_valid,
+    )
+
+
+@triton.jit(
     do_not_specialize=["sequence_length"],
     do_not_specialize_on_alignment=["sequence_length"],
 )
@@ -901,12 +944,22 @@ class TritonAttention(torch.autograd.Function):
         batch, heads, sequence_length, head_dim = query.shape
         needs_backward = any(ctx.needs_input_grad[:3])
         use_fused_backward = needs_backward and head_dim == 32
+        use_chunked_backward = (
+            needs_backward
+            and all(ctx.needs_input_grad[:3])
+            and batch <= 2
+            and head_dim == 64
+            and sequence_length == 1024
+            and causal
+            and query.dtype == torch.float16
+            and torch.version.hip is not None
+        )
         output = torch.empty(
             query.shape,
             dtype=query.dtype,
             device=query.device,
         )
-        if use_fused_backward:
+        if use_fused_backward or use_chunked_backward:
             logsumexp = torch.empty(
                 (batch, heads, sequence_length),
                 dtype=torch.float32,
@@ -1014,7 +1067,7 @@ class TritonAttention(torch.autograd.Function):
             block_m=block_m,
             block_n=block_n,
             causal=causal,
-            save_stats=use_fused_backward,
+            save_stats=use_fused_backward or use_chunked_backward,
             num_warps=warps,
             num_stages=stages,
             waves_per_eu=waves_per_eu,
@@ -1029,9 +1082,17 @@ class TritonAttention(torch.autograd.Function):
                     output,
                     logsumexp,
                 )
+            elif use_chunked_backward:
+                ctx.save_for_backward(
+                    query,
+                    key,
+                    value,
+                    logsumexp,
+                )
             else:
                 ctx.save_for_backward(query, key, value)
             ctx.use_fused_backward = use_fused_backward
+            ctx.use_chunked_backward = use_chunked_backward
             ctx.input_grad_mask = ctx.needs_input_grad[:3]
             ctx.causal = causal
             ctx.scale = scale
@@ -1046,6 +1107,8 @@ class TritonAttention(torch.autograd.Function):
 
     @staticmethod
     def _backward_impl(ctx, grad_output):
+        if ctx.use_chunked_backward:
+            return TritonAttention._backward_chunked(ctx, grad_output)
         if not ctx.use_fused_backward:
             return TritonAttention._backward_matmul(ctx, grad_output)
         query, key, value, output, logsumexp = ctx.saved_tensors
@@ -1148,6 +1211,122 @@ class TritonAttention(torch.autograd.Function):
             allow_flush_denorm=True,
         )
         return grad_query, grad_key, grad_value, None, None
+
+    @staticmethod
+    def _backward_chunked(ctx, grad_output):
+        query, key, value, logsumexp = ctx.saved_tensors
+        batch, heads, sequence_length, head_dim = query.shape
+        batch_heads = batch * heads
+        block_rows = 256
+        scale = ctx.scale
+        scale_log2 = scale * 1.4426950408889634
+
+        query_float = query.float().contiguous().view(
+            batch_heads,
+            sequence_length,
+            head_dim,
+        )
+        key_float = key.float().contiguous().view(
+            batch_heads,
+            sequence_length,
+            head_dim,
+        )
+        value_float = value.float().contiguous().view(
+            batch_heads,
+            sequence_length,
+            head_dim,
+        )
+        grad_output_float = grad_output.float().contiguous().view(
+            batch_heads,
+            sequence_length,
+            head_dim,
+        )
+        grad_query = torch.empty_like(query_float)
+        grad_key = torch.zeros_like(key_float)
+        grad_value = torch.zeros_like(value_float)
+        probabilities = torch.empty(
+            (batch_heads, block_rows, sequence_length),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        grad_score = torch.empty_like(probabilities)
+        grad_query_block = torch.empty(
+            (batch_heads, block_rows, head_dim),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        key_transposed = key_float.transpose(1, 2)
+        value_transposed = value_float.transpose(1, 2)
+        probability_rows = batch_heads * block_rows
+        probability_block = triton.next_power_of_2(sequence_length)
+
+        for query_start in range(0, sequence_length, block_rows):
+            query_block = query_float[
+                :,
+                query_start:query_start + block_rows,
+            ]
+            grad_output_block = grad_output_float[
+                :,
+                query_start:query_start + block_rows,
+            ]
+            torch.bmm(query_block, key_transposed, out=probabilities)
+            _attention_probabilities_from_logsumexp[(probability_rows,)](
+                probabilities,
+                logsumexp,
+                scale_log2,
+                sequence_length,
+                query_start,
+                block_rows=block_rows,
+                block_n=probability_block,
+                num_warps=1,
+                num_stages=1,
+                waves_per_eu=1,
+                allow_flush_denorm=True,
+            )
+            torch.bmm(
+                grad_output_block,
+                value_transposed,
+                out=grad_score,
+            )
+            _attention_backward_score[(probability_rows,)](
+                probabilities,
+                grad_score,
+                sequence_length,
+                block_n=probability_block,
+                num_warps=1,
+                num_stages=1,
+                waves_per_eu=1,
+                allow_flush_denorm=True,
+            )
+            torch.bmm(grad_score, key_float, out=grad_query_block)
+            grad_query_block.mul_(scale)
+            grad_query[
+                :,
+                query_start:query_start + block_rows,
+            ].copy_(grad_query_block)
+            torch.baddbmm(
+                grad_key,
+                grad_score.transpose(1, 2),
+                query_block,
+                beta=1.0,
+                alpha=scale,
+                out=grad_key,
+            )
+            torch.baddbmm(
+                grad_value,
+                probabilities.transpose(1, 2),
+                grad_output_block,
+                beta=1.0,
+                out=grad_value,
+            )
+
+        return (
+            grad_query.view_as(query).to(query.dtype),
+            grad_key.view_as(key).to(key.dtype),
+            grad_value.view_as(value).to(value.dtype),
+            None,
+            None,
+        )
 
     @staticmethod
     def _backward_matmul(ctx, grad_output):

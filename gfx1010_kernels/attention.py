@@ -113,7 +113,8 @@ def _fast_path_reason(
         return "query, key and value must be on the same device"
     if (
         torch.is_autocast_enabled("cuda")
-        and torch.get_autocast_dtype("cuda") != torch.float16
+        and torch.get_autocast_dtype("cuda")
+        not in (torch.float16, torch.float32)
     ):
         return "the optimized kernel requires float16 CUDA autocast"
     fp32_autocast = _uses_fp16_autocast(query, key, value)
@@ -181,7 +182,7 @@ def _uses_fp16_autocast(query, key, value):
     )
 
 
-def _auto_training_fallback_reason(query, key, value):
+def _auto_training_fallback_reason(query, key, value, is_causal):
     if (
         not torch.is_grad_enabled()
         or not any(tensor.requires_grad for tensor in (query, key, value))
@@ -191,6 +192,26 @@ def _auto_training_fallback_reason(query, key, value):
     batch_heads = query.shape[0] * query.shape[1]
     sequence_length = query.shape[-2]
     head_dim = query.shape[-1]
+    is_gpt2_d64 = (
+        query.shape[1] == 12
+        and sequence_length == 1024
+        and head_dim == 64
+    )
+    if is_gpt2_d64:
+        if (
+            is_causal
+            and query.dtype == torch.float16
+            and query.shape[0] <= 2
+            and all(
+                tensor.requires_grad
+                for tensor in (query, key, value)
+            )
+        ):
+            return None
+        return (
+            "the GPT-2 D64 training kernel requires causal FP16 inputs, "
+            "B <= 2, and gradients for query, key, and value"
+        )
     use_hybrid = (
         sequence_length <= 192
         and 8 <= batch_heads <= 512
@@ -280,7 +301,12 @@ def scaled_dot_product_attention(
         enable_gqa,
     )
     if implementation == "auto" and reason is None:
-        reason = _auto_training_fallback_reason(query, key, value)
+        reason = _auto_training_fallback_reason(
+            query,
+            key,
+            value,
+            is_causal,
+        )
     if implementation == "auto" and reason:
         warnings.warn(
             f"gfx1010 optimized attention was not used: {reason}",

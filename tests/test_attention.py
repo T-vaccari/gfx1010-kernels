@@ -2,6 +2,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+import gfx1010_kernels.attention as attention_module
 from gfx1010_kernels import (
     __version__,
     backend_status,
@@ -978,6 +979,141 @@ def test_gpt2_d64_backward(batch):
             atol=4e-2,
             rtol=4e-2,
         )
+
+
+@pytest.mark.skipif(
+    not backend_status().available,
+    reason="requires the gfx1010 ROCm server",
+)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_gpt2_d64_auto_backward(monkeypatch, batch):
+    torch.manual_seed(2008 + batch)
+    shape = (batch, 12, 1024, 64)
+    source = [
+        torch.randn(shape, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    fast = [tensor.detach().clone().requires_grad_() for tensor in source]
+    reference = [
+        tensor.detach().clone().requires_grad_()
+        for tensor in source
+    ]
+    grad = torch.randn(shape, device="cuda", dtype=torch.float16)
+    expected = scaled_dot_product_attention(
+        *reference,
+        is_causal=True,
+        implementation="torch",
+    )
+    expected.backward(grad)
+
+    def reject_fallback(*args, **kwargs):
+        raise AssertionError("auto used the PyTorch fallback")
+
+    monkeypatch.setattr(
+        attention_module,
+        "_torch_attention",
+        reject_fallback,
+    )
+    actual = scaled_dot_product_attention(
+        *fast,
+        is_causal=True,
+        implementation="auto",
+    )
+    actual.backward(grad)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    for actual_tensor, expected_tensor in zip(fast, reference):
+        torch.testing.assert_close(
+            actual_tensor.grad,
+            expected_tensor.grad,
+            atol=4e-2,
+            rtol=4e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not backend_status().available,
+    reason="requires the gfx1010 ROCm server",
+)
+def test_gpt2_d64_auto_accepts_explicit_fp16_under_fp32_autocast(
+    monkeypatch,
+):
+    shape = (1, 12, 1024, 64)
+    source = [
+        torch.randn(
+            shape,
+            device="cuda",
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    ]
+
+    def reject_fallback(*args, **kwargs):
+        raise AssertionError("auto used the PyTorch fallback")
+
+    monkeypatch.setattr(
+        attention_module,
+        "_torch_attention",
+        reject_fallback,
+    )
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.float32,
+    ):
+        actual = scaled_dot_product_attention(
+            *source,
+            is_causal=True,
+            implementation="auto",
+        )
+    actual.sum().backward()
+    assert all(tensor.grad is not None for tensor in source)
+
+
+@pytest.mark.skipif(
+    not backend_status().available,
+    reason="requires the gfx1010 ROCm server",
+)
+@pytest.mark.parametrize(
+    ("batch", "is_causal", "requires_grad"),
+    [
+        (1, False, (True, True, True)),
+        (1, True, (True, False, False)),
+        (3, True, (True, True, True)),
+    ],
+)
+def test_gpt2_d64_auto_unsupported_falls_back(
+    monkeypatch,
+    batch,
+    is_causal,
+    requires_grad,
+):
+    shape = (batch, 12, 1024, 64)
+    source = [
+        torch.randn(
+            shape,
+            device="cuda",
+            dtype=torch.float16,
+            requires_grad=gradient,
+        )
+        for gradient in requires_grad
+    ]
+    sentinel = torch.empty(0, device="cuda")
+    calls = 0
+
+    def fallback(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return sentinel
+
+    monkeypatch.setattr(attention_module, "_torch_attention", fallback)
+    with pytest.warns(RuntimeWarning, match="GPT-2 D64"):
+        actual = scaled_dot_product_attention(
+            *source,
+            is_causal=is_causal,
+            implementation="auto",
+        )
+    assert actual is sentinel
+    assert calls == 1
 
 
 @pytest.mark.skipif(
