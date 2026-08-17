@@ -130,13 +130,15 @@ hybrid backward built from Triton row kernels and ROCm matrix products. The
 general hybrid route materializes the N×N attention matrix and is therefore
 restricted by the `auto` performance guard.
 
-Causal FP16 GPT-2 training at `B<=2`, `H=12`, `N=1024`, `D=64` has a separate
+Causal FP16 GPT-2 training at `B<=4`, `H=12`, `N=1024`, `D=64` has a separate
 chunked backward. It reuses the forward log-sum-exp values and reconstructs
-256 query rows at a time, so its working memory is
-O(batch·heads·256·N + batch·heads·N·D), rather than O(batch·heads·N²).
-The matrix contractions use ROCm BLAS and the causal softmax reconstruction and
-derivative use Triton. Unsupported batch sizes, non-causal calls, BF16, and
-partial Q/K/V gradient requests remain on the PyTorch fallback in `auto` mode.
+512 query rows at a time, so its working memory is
+O(batch·heads·512·N + batch·heads·N·D), rather than O(batch·heads·N²).
+The matrix contractions use ROCm BLAS. A fused Triton row kernel reconstructs
+the causal softmax probabilities and applies their backward derivative,
+avoiding a second launch and reread of the probability buffer. Unsupported
+batch sizes, non-causal calls, BF16, and partial Q/K/V gradient requests remain
+on the PyTorch fallback in `auto` mode.
 
 ### Attention fast-path support
 
@@ -175,7 +177,7 @@ and AMD waves per execution unit.
 | D32 training | BH≥64 and N≥1024, or N≥4096 | BMK8/BNK32 and BMQ32/BNQ8, w2/s1/v1 |
 | D64 inference | default | BM16/BN8, w1/s1/v1 |
 | D64 causal inference | BH≥8 and N≥1024 | BM32/BN4, w2; s2 below 4096, otherwise s1 |
-| D64 GPT-2 training | B≤2, H=12, N=1024, causal FP16, all Q/K/V gradients | fused streaming forward; 256-row chunked backward |
+| D64 GPT-2 training | B≤4, H=12, N=1024, causal FP16, all Q/K/V gradients | fused streaming forward; 512-row chunked backward with fused probability/score derivative |
 | D128 inference | default | BM8/BN4, w1/s1/v1 |
 | D128 causal inference | BH≥8 and N≥1024 | BM16/BN4, w2/s1/v1 |
 
@@ -284,7 +286,7 @@ BF16 autocast deliberately falls back.
 
 For compatible D=32 calls, `auto` always selects the custom path. During
 training, the specialized causal FP16 GPT-2 profile selects the chunked
-backward at B≤2, H=12, N=1024 and D=64 when all Q/K/V gradients are required.
+backward at B≤4, H=12, N=1024 and D=64 when all Q/K/V gradients are required.
 The remaining D=64/128 profiles select the general hybrid backward at N≤192
 when 8≤BH≤512; D=64 also selects it for 192<N≤1024 when BH≥64 and
 BH·N²≤64·1024². Other D=64/128 training profiles fall back because PyTorch
@@ -422,8 +424,8 @@ are below. Times cover attention only, not a complete Transformer.
 
 | Mode | B | H | N | D | gfx1010 ms | PyTorch ms | Speedup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| training total | 1 | 12 | 1024 | 64 | 7.253 | 8.438 | 1.16× |
-| training total | 2 | 12 | 1024 | 64 | 13.236 | 14.404 | 1.09× |
+| training total | 1 | 12 | 1024 | 64 | 6.729 | 8.447 | 1.26× |
+| training total | 2 | 12 | 1024 | 64 | 11.751 | 14.404 | 1.23× |
 | inference | 64 | 8 | 64 | 32 | 0.164 | 0.877 | 5.33× |
 | training total | 64 | 8 | 64 | 32 | 0.617 | 1.858 | 3.01× |
 | inference | 64 | 8 | 192 | 32 | 0.987 | 4.610 | 4.67× |
@@ -445,18 +447,23 @@ are below. Times cover attention only, not a complete Transformer.
 | inference | 1 | 8 | 4096 | 128 | 32.685 | 36.766 | 1.12× |
 
 For the specialized B=2 GPT-2 row, the custom forward/backward medians were
-2.978/10.371 ms versus 6.781/7.662 ms for forced PyTorch math SDPA. Peak
+2.862/8.978 ms versus 6.781/7.662 ms for forced PyTorch math SDPA. Peak
 incremental allocated/reserved memory for the complete custom call was
-109.15/115.34 MiB versus 424.67/429.92 MiB for PyTorch math SDPA. Three seeds
-at both B=1 and B=2 passed output, dQ, dK and dV comparison with no non-finite
-values; worst absolute error was 0.001953125.
+153.09/138.00 MiB versus 424.67/429.92 MiB for PyTorch math SDPA. Three seeds
+at B=1, B=2 and B=4 passed output, dQ, dK and dV comparison with no non-finite
+values; worst absolute error was 0.001953125. Incremental allocated memory was
+77.05/153.09/306.19 MiB at B=1/2/4, confirming linear batch scaling without a
+persistent N×N buffer.
 
 The end-to-end acceptance workload was a compiled FP32 GPT-2 model with only
 Q/K/V attention inputs cast to FP16, B=2, H=12, N=1024, D=64, and eight
-gradient-accumulation microsteps. Excluding the compilation step, 14 sustained
-steps measured a mean 3689.13 tokens/s (range 3685.97–3693.09), exceeding the
-3500 tokens/s FP32 baseline by 5.4%. Casting all linear layers to FP16 is a
-different execution path and was slower on this GPU.
+gradient-accumulation microsteps. Excluding the compilation step, two runs of
+14 sustained steps measured 3820.456 and 3820.394 tokens/s. Their combined
+mean was 3820.425 tokens/s (range 3813.94–3825.75), exceeding the 3500 tokens/s
+FP32 baseline by 9.2%. Casting all linear layers to FP16 is a different
+execution path and was slower on this GPU. The B=4 attention operator passes
+correctness and memory validation, but this complete GPT-2 workload does not
+fit in the RX 5600 XT's 6 GiB VRAM at physical B=4.
 
 The PyTorch comparison is the implementation available in this exact
 machine-specific build; it reports that memory-efficient SDPA was not compiled
